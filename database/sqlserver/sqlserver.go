@@ -59,22 +59,25 @@ type SQLServer struct {
 	config *Config
 }
 
-// WithInstance returns a database instance from an already created database connection.
-//
-// Note that the deprecated `mssql` driver is not supported. Please use the newer `sqlserver` driver.
-func WithInstance(instance *sql.DB, config *Config) (database.Driver, error) {
+func WithConnection(ctx context.Context, conn *sql.Conn, config *Config) (*SQLServer, error) {
 	if config == nil {
 		return nil, ErrNilConfig
 	}
 
-	if err := instance.Ping(); err != nil {
+	if err := conn.PingContext(ctx); err != nil {
 		return nil, err
+	}
+
+	ss := SQLServer{
+		db:     nil,
+		conn:   conn,
+		config: config,
 	}
 
 	if config.DatabaseName == "" {
 		query := `SELECT DB_NAME()`
 		var databaseName string
-		if err := instance.QueryRow(query).Scan(&databaseName); err != nil {
+		if err := conn.QueryRowContext(ctx, query).Scan(&databaseName); err != nil {
 			return nil, &database.Error{OrigErr: err, Query: []byte(query)}
 		}
 
@@ -88,7 +91,7 @@ func WithInstance(instance *sql.DB, config *Config) (database.Driver, error) {
 	if config.SchemaName == "" {
 		query := `SELECT SCHEMA_NAME()`
 		var schemaName string
-		if err := instance.QueryRow(query).Scan(&schemaName); err != nil {
+		if err := conn.QueryRowContext(ctx, query).Scan(&schemaName); err != nil {
 			return nil, &database.Error{OrigErr: err, Query: []byte(query)}
 		}
 
@@ -103,21 +106,35 @@ func WithInstance(instance *sql.DB, config *Config) (database.Driver, error) {
 		config.MigrationsTable = DefaultMigrationsTable
 	}
 
-	conn, err := instance.Conn(context.Background())
+	if err := ss.ensureVersionTable(); err != nil {
+		return nil, err
+	}
+
+	return &ss, nil
+}
+
+// WithInstance returns a database instance from an already created database connection.
+//
+// Note that the deprecated `mssql` driver is not supported. Please use the newer `sqlserver` driver.
+func WithInstance(instance *sql.DB, config *Config) (database.Driver, error) {
+	ctx := context.Background()
+
+	if err := instance.Ping(); err != nil {
+		return nil, err
+	}
+
+	conn, err := instance.Conn(ctx)
 
 	if err != nil {
 		return nil, err
 	}
 
-	ss := &SQLServer{
-		conn:   conn,
-		db:     instance,
-		config: config,
-	}
-
-	if err := ss.ensureVersionTable(); err != nil {
+	ss, err := WithConnection(ctx, conn, config)
+	if err != nil {
 		return nil, err
 	}
+
+	ss.db = instance
 
 	return ss, nil
 }
@@ -184,7 +201,10 @@ func (ss *SQLServer) Open(url string) (database.Driver, error) {
 // Close the database connection
 func (ss *SQLServer) Close() error {
 	connErr := ss.conn.Close()
-	dbErr := ss.db.Close()
+	var dbErr error
+	if ss.db != nil {
+		dbErr = ss.db.Close()
+	}
 	if connErr != nil || dbErr != nil {
 		return fmt.Errorf("conn: %v, db: %v", connErr, dbErr)
 	}
